@@ -17,7 +17,8 @@ rows, CUDA graph replay against eager, and paired timing against the staged rout
 The fused routes need a layout of FUSED_LAYOUTS (mega_moe_config.py) on an
 8-XCD gfx950: DeepSeek-V4-Pro (--network v4_pro) on 8 ranks, or DeepSeek-V4.1-Flash
 (--network v41_flash) on the rank counts listed there (EP8: 8 ranks, EP4: 4 ranks, EP2: 2 ranks).
-With --quant a4w4 the instance has the small-input and staged routes (no large-input route).
+With --quant a4w4 the instance has the same routes; its fused routes write an FP8 GEMM1 output where the
+staged route writes FP4, so a fused route matches the staged one to --rtol (0.25), not bit for bit.
 
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --bs-list 1,64,128
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --max-tok-per-rank 8192 \
@@ -27,6 +28,8 @@ With --quant a4w4 the instance has the small-input and staged routes (no large-i
     torchrun --nproc-per-node 4 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
     torchrun --nproc-per-node 2 test_mega_moe_v2.py --suite routes --network v41_flash --check-time-acc
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes --network v41_flash --quant a4w4
+    torchrun --nproc-per-node 8 test_mega_moe_v2.py --max-tok-per-rank 16384 --quant a4w4 \
+        --expect-large-m --compare-main --bs-list 513,4096,8192,16384 --accuracy-max-bs 16384
     # against a same-MTPR staged route, timing only:
     torchrun --nproc-per-node 8 test_mega_moe_v2.py --suite routes \
         --mtpr 256 --small-m-mtprs 256 --time-only --time-bs 140,168,196,224,252
@@ -769,7 +772,7 @@ def _check_large_m_edges(
         "inter_dim": moe.inter_dim,
         "experts": moe.experts,
         "topk": moe.topk,
-        "quant": "a8w4",
+        "quant": "a4w4" if moe._a_dtype == "fp4" else "a8w4",
         "swiglu_limit": moe.swiglu_limit,
     }
     if not fused_layout_supported(**layout) or fused_layout_supported(
@@ -874,11 +877,13 @@ def _run_layer_slot_stress(moe, x, weights, ids, slots, cycles, rank, rtol):
     # A few slots per cycle, covering both layers, are checked against the main path on the same
     # binding. With the default fused knobs (EP8 V4-Pro) the large-M path matches it bit for bit; a
     # tuned layout (EP4 V4.1-Flash: FP8 combine rows, BF16 head tokens) sums in another order, so it
-    # is held to rtol, far below the error of a stale binding (layer B doubles W2).
+    # is held to rtol, far below the error of a stale binding (layer B doubles W2). So is A4W4, whose
+    # large-M GEMM1 output is FP8 where the main path's is FP4.
     config = moe._large_m._select_config(tokens)
     exact = (
         config.fused_stage1 == FusedStage1Knobs()
         and config.fused_stage2 == FusedStage2Knobs()
+        and moe._a_dtype == "fp8"
     )
     checked_slots = {0, 1, slots - 1}
     checked = 0
@@ -1003,12 +1008,13 @@ def _run_skewed_route_switch(moe, x, weights, ids, rounds, seed, rank, world):
     _barrier()
     # The large-M kernels of a layout without fused-knob tuning (V4-Pro EP8) run main's arithmetic and match
     # it bit-for-bit; a tuned layout (V4.1-Flash EP8) sends other bytes (one row per token and destination,
-    # int8 transport), so there only rows off by a sizable part of their own norm count as corrupted.
+    # int8 transport), so there only rows off by a sizable part of their own norm count as corrupted. So does
+    # A4W4: its large-M GEMM1 output is FP8, main's FP4.
     config = moe._large_m._active_config
     exact = (config.fused_stage1, config.fused_stage2) == (
         FusedStage1Knobs(),
         FusedStage2Knobs(),
-    )
+    ) and moe._a_dtype == "fp8"
     worst = 0.0
     failures = []
     for round_idx in range(rounds):
