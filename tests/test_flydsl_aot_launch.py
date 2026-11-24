@@ -12,7 +12,8 @@ output is not bitwise reproducible):
 * ``aot miss``: ``=1`` on an empty directory. Every launch exports.
 * ``aot hit``: ``=1`` again. Every launch loads its object, nothing builds.
 
-All modes must produce bitwise identical outputs.
+All modes must produce bitwise identical outputs. The GDN hidden-state kernel
+and the paged-attention decode planner are checked the same way.
 """
 
 import argparse
@@ -734,14 +735,80 @@ def child():
     print("STATE " + json.dumps(state), flush=True)
 
 
-def run_mode(mode, cache_dir):
+def child_gdn_h_and_pa_plan():
+    """Two configs each of the GDN hidden-state kernel and the paged-attention
+    decode planner, through ``_run_compiled`` as their public ops launch them."""
+    import torch
+
+    from aiter.ops.flydsl import linear_attention_prefill_kernels as gdn
+    from aiter.ops.flydsl.aot_cache import _JitKernel
+    from aiter.ops.flydsl.kernels import pa_decode_plan as planner
+
+    def digest(*tensors):
+        h = hashlib.sha256()
+        for t in tensors:
+            if t is not None:
+                h.update(t.contiguous().view(torch.uint8).cpu().numpy().tobytes())
+        return h.hexdigest()
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device).manual_seed(0)
+    H, Hg, K = 4, 2, 128
+    for name, seqs in (("dense", None), ("varlen", (100, 157))):
+        T = 256 if seqs is None else sum(seqs)
+        k = torch.randn(1, T, Hg, K, generator=gen, device=device) * 0.1
+        w = torch.randn(1, H, T, K, generator=gen, device=device) * 0.1
+        u = torch.randn(1, H, T, K, generator=gen, device=device) * 0.1
+        g = -torch.rand(1, T, H, generator=gen, device=device).cumsum(1) * 0.05
+        kwargs = {"g": g, "use_exp2": False}
+        if seqs is not None:
+            n = len(seqs)
+            offsets = [0, *torch.tensor(seqs).cumsum(0).tolist()]
+            kwargs.update(
+                cu_seqlens=torch.tensor(offsets, dtype=torch.int32, device=device),
+                seq_lens_cpu=list(seqs),
+                initial_state=torch.randn(n, H, K, K, generator=gen, device=device),
+                output_final_state=True,
+            )
+        h, v_new, final = gdn.chunk_gated_delta_rule_fwd_h_flydsl_opt(
+            k.bfloat16(), w.bfloat16(), u.bfloat16(), **kwargs
+        )
+        torch.cuda.synchronize()
+        print("RESULT " + json.dumps([f"gdn_h/{name}", digest(h, v_new, final)]))
+    for batch, window in ((7, 0), (300, 512)):
+        lengths = torch.randint(
+            -5, 70000, (batch,), generator=gen, device=device, dtype=torch.int32
+        )
+        plan = planner.plan_pa_decode(lengths, 2, sliding_window=window)
+        torch.cuda.synchronize()
+        print(
+            "RESULT "
+            + json.dumps(
+                [f"pa_plan/{batch}/{window}", digest(plan.work_info, plan.reduce_info)]
+            )
+        )
+    state = {}
+    for cache in (
+        gdn._get_or_compile_opt.aot_cache,
+        planner.compile_pa_decode_plan.aot_cache,
+    ):
+        kernels = list(cache._mem.values())
+        state[cache.name] = {
+            "entries": len(kernels),
+            "jit": sum(isinstance(k, _JitKernel) for k in kernels),
+            "builds": cache._builds,
+        }
+    print("STATE " + json.dumps(state), flush=True)
+
+
+def run_mode(mode, cache_dir, child="--child"):
     env = {
         **os.environ,
         "AITER_FLYDSL_AOT_CACHE": mode,
         "AITER_FLYDSL_AOT_CACHE_DIR": cache_dir,
     }
     proc = subprocess.run(
-        [sys.executable, __file__, "--child"],
+        [sys.executable, __file__, child],
         env=env,
         capture_output=True,
         text=True,
@@ -756,7 +823,7 @@ def run_mode(mode, cache_dir):
             outs[name] = digest
         elif line.startswith("STATE "):
             state = json.loads(line[len("STATE ") :])
-    assert outs, f"mode {mode} ran no prefill row"
+    assert outs, f"mode {mode} ran no case"
     return outs, state
 
 
@@ -795,8 +862,43 @@ def test_moe_gfx942_through_aot_cache():
     assert jit == miss == hit, f"outputs differ:\n{jit}\n{miss}\n{hit}"
 
 
+def test_gdn_h_and_pa_plan_through_aot_cache():
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() not in ("gfx942", "gfx950"):
+        pytest.skip(f"the GDN hidden-state kernel is not run on {get_gfx_runtime()}")
+    if not hasattr(flyc, "load_module"):
+        pytest.skip("FlyDSL has no flyc.load_module, so every mode would run the JIT")
+
+    child = "--child-gdn-h-pa-plan"
+    with tempfile.TemporaryDirectory() as cache_dir:
+        jit, state = run_mode("0", cache_dir, child)
+        assert all(s["entries"] == 0 for s in state.values()), state
+        assert not any(Path(cache_dir).rglob("*.o")), "mode 0 wrote the AOT cache"
+
+        miss, state = run_mode("1", cache_dir, child)
+        for name, s in state.items():
+            assert s["entries"] == 2, f"{name}: expected two entries: {s}"
+            assert s["jit"] == 0, f"{name} fell back to the JIT: {s}"
+            assert s["builds"] == s["entries"], f"{name} did not export: {s}"
+        built = {p: p.stat().st_mtime_ns for p in Path(cache_dir).rglob("*.o")}
+
+        hit, state = run_mode("1", cache_dir, child)
+        for name, s in state.items():
+            assert s["entries"] == 2, f"{name} skipped the cache: {s}"
+            assert s["jit"] == 0 and s["builds"] == 0, f"{name} rebuilt: {s}"
+        after = {p: p.stat().st_mtime_ns for p in Path(cache_dir).rglob("*.o")}
+        assert after == built, "aot hit rewrote the AOT cache"
+
+    assert jit == miss == hit, f"outputs differ:\n{jit}\n{miss}\n{hit}"
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--child", action="store_true", required=True)
-    parser.parse_args()
-    child()
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--child", action="store_true")
+    group.add_argument("--child-gdn-h-pa-plan", action="store_true")
+    if parser.parse_args().child:
+        child()
+    else:
+        child_gdn_h_and_pa_plan()
