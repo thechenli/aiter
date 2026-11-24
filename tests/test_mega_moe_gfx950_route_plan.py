@@ -422,10 +422,16 @@ def test_ep8_fused_configs_keep_fused_knobs_off():
         assert config.fused_stage2 == FusedStage2Knobs(), (mtpr, tokens)
 
 
-# Fused knobs added after the digests below were pinned (stream_w with the EP2 V4.1-Flash tune, the GEMM1 K-loop
-# knobs with the A4W4 tunes): they enter the table only when set, so a pinned digest changes only where a config
-# sets one.
-_LATE_KNOBS = ("stream_w", "g1_unroll_k", "g1_pair_k")
+# Fused knobs added after the digests below were pinned (stream_w with the EP2 V4.1-Flash tune, the GEMM1 K-loop,
+# light-release and split-tail knobs with the A4W4 tunes): they enter the table only when set, so a pinned digest
+# changes only where a config sets one.
+_LATE_KNOBS = (
+    "stream_w",
+    "g1_unroll_k",
+    "g1_pair_k",
+    "light_release",
+    "g1_split_tail",
+)
 
 
 def _knob_table(config):
@@ -1010,3 +1016,55 @@ def test_large_m_gemm1_k_loop_knobs_enter_the_spec():
     assert spec(g1_pair_k=True)["g1_pair_k"] == 1
     with pytest.raises(AssertionError):
         spec(g1_unroll_k=True, g1_pair_k=True)
+
+
+_FUSED_SHAPES = ({}, V41_FLASH_EP4_SHAPE, V41_FLASH_EP2_SHAPE, V41_FLASH_EP8_SHAPE)
+
+
+def test_large_m_buckets():
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import large_m_buckets
+
+    assert large_m_buckets(1024) == (512, 1024)
+    assert large_m_buckets(16384) == (512, 1024, 2048, 4096, 8192, 16384)
+
+
+@pytest.mark.parametrize("quant", ("a8w4", "a4w4"))
+@pytest.mark.parametrize("shape", _FUSED_SHAPES)
+def test_large_m_bucket_configs_share_the_runtime_knobs(shape, quant):
+    """A large-input call launches the config of its EP-wide max_tokens; the runtime's buffers and the routes'
+    shared storage follow the capacity's config, so every bucket keeps its runtime knobs. A8W4 runs one config
+    per capacity."""
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+        large_m_buckets,
+        large_m_mtprs_for,
+        large_m_runtime_knobs,
+    )
+
+    dims = {
+        "world_size": shape.get("world_size", 8),
+        "model_dim": shape.get("model_dim", 7168),
+        "inter_dim": shape.get("inter_dim", 3072),
+    }
+    for mtpr in large_m_mtprs_for(**dims):
+        capacity = select_fused_config(mtpr, mtpr, quant=quant, **shape)
+        for bucket in large_m_buckets(mtpr):
+            config = select_fused_config(bucket, mtpr, quant=quant, **shape)
+            assert large_m_runtime_knobs(config) == large_m_runtime_knobs(capacity)
+            if quant == "a8w4":
+                assert config == capacity, (mtpr, bucket)
+
+
+def test_small_m_late_knobs_enter_the_kernel_name_only_when_set():
+    from dataclasses import replace
+
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_small_m import _kernel_knobs
+
+    base = select_fused_config(16, 512, quant="a4w4")
+    knobs = _kernel_knobs(base)
+    assert knobs["light_release"] is False and knobs["g1_split_tail"] == 0
+    config = replace(
+        base,
+        fused_stage1=replace(base.fused_stage1, light_release=True, g1_split_tail=24),
+    )
+    knobs = _kernel_knobs(config)
+    assert knobs["light_release"] is True and knobs["g1_split_tail"] == 24

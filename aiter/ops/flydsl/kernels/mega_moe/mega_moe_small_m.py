@@ -312,13 +312,16 @@ def emit_direct_fixed_slot_payload(
     *, num_waves, fz_npes, fz_epr, fz_k, fz_cap, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes,
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
     i32_cur_tok, dispatch_blocks, producer_slot, parity, expected, prefetched, route_rounds, prefetch_args,
-    dedup=False, direct_done=0, running_half=None,
+    dedup=False, direct_done=0, running_half=None, light_release=False,
 ):
 # fmt: on
     """Allocate and publish routes directly into destination fixed slots.
 
     ``running_half``: the destinations' expert counters are two halves of fz_epr; the routes count into this one,
     and their srcmap and weight go to the same half of the destinations' two halves of fz_epr * fz_cap slots.
+    ``light_release``: the source flag follows the drain of the producers' stores without a system release (an L2
+    writeback): the routes' rows, scales and metadata go to the peers' uncached symmetric heap, so they are in
+    memory once the stores drained.
     """
     # prefetch_direct_fixed_slot_route loaded this wave's first len(prefetched) routes before the epoch gate.
     p_source_done = prefetched[0]["tables"]["source_done"]
@@ -413,7 +416,8 @@ def emit_direct_fixed_slot_payload(
             if warp == fx.Int32(0):
                 if producer_slot < active:
                     if lane < fx.Int32(fz_npes):
-                        comm_ops.fence_system_release()
+                        if const_expr(not light_release):
+                            comm_ops.fence_system_release()
                         share = (producer_slot == fx.Int32(0)).select(
                             fx.Int32(_DIRECT_DONE_INC + 1) - active, fx.Int32(1))
                         remote_done = ptr_buf_tensor(p_source_done, fx.Int64)[lane]
@@ -424,7 +428,8 @@ def emit_direct_fixed_slot_payload(
     if publish_last:
         done_lane = fx.Int32(0)
         if lane == fx.Int32(0):
-            comm_ops.fence_system_release()
+            if const_expr(not light_release):
+                comm_ops.fence_system_release()
             done_lane = fx.Int32(comm_ops.atomic_add_agent(a_producer_done, fx.Int32(1)))
         done = fx.Int32(fx.rocdl.readlane(T.i32, done_lane, 0))
         if done == fx.Int32(dispatch_blocks - 1):
@@ -440,6 +445,8 @@ def emit_direct_fixed_slot_payload(
 # of them landed. Every bucket of such a runtime uses direct_done, as the ranks of a launch may run different
 # buckets.
 _DIRECT_DONE_INC = 64
+# g1_split_tail: bit of the GEMM1 work word that carries the unit's piece (0: whole, 1 / 2: first / second half).
+_PIECE_SHIFT = 28
 
 
 def _plan_counts(a_running, lane, fz_epr, fz_cap, fz_tile_m, count_cm=0):
@@ -873,6 +880,7 @@ def compile_mega_moe_stage1(
     g2_epi_lean: int = 0, g1_lookahead: int = 1, g1_a_ahead: int = 1, direct_done: int = 0, tok_done: bool = False,
     tok_counters: bool = False, bf16_head_tokens: int = 0, epi_evec: int = 2, epi_lean: int = 0,
     ascale_packed: bool = False, stream_w: bool = False, a_dtype: str = "fp8", g1_unroll: bool = False,
+    light_release: bool = False, g1_split_tail: int = 0,
 ):
     arch = get_gfx_runtime()
     if arch != "gfx950":
@@ -1018,6 +1026,13 @@ def compile_mega_moe_stage1(
     # the GEMM1 units on the GEMM1 counter.
     G2_EARLY_K, G2_EARLY_P = (int(v) for v in g2_early)
     assert G2_EARLY_K == 0 or (G2_EARLY_K >= 2 and 0 < G2_EARLY_P < 16)
+    # g1_split_tail = S > 0: the partial last round of an XCD slice's GEMM1 units (at most S of them, and no more
+    # than the slice's CTAs left idle in that round) runs as two half-width units each, so the round's tail is
+    # spread over more CTAs. GEMM2 readiness then counts half-width units (a whole unit counts 2).
+    SPLIT_TAIL = int(g1_split_tail)
+    assert SPLIT_TAIL >= 0
+    if SPLIT_TAIL:
+        assert (tile_n // 2) % NUM_WAVES == 0 and (tile_n // 2 // NUM_WAVES // 16) % 2 == 0, tile_n
 
     @fx.struct
     class SharedStorage:
@@ -1052,6 +1067,7 @@ def compile_mega_moe_stage1(
         f"{f'_ek{G2_EARLY_K}p{G2_EARLY_P}' if G2_EARLY_K else ''}"
         f"{'_stw' if stream_w else ''}"
         f"{'_uk' if g1_unroll else ''}"
+        f"{'_lr' if light_release else ''}{f'_spt{g1_split_tail}' if g1_split_tail else ''}"
         f"{'_afp4' if a_fp4 else ''}"
     )
 
@@ -1181,6 +1197,7 @@ def compile_mega_moe_stage1(
                 i32_cur_tok=i32_cur_tok, dispatch_blocks=dispatch_blocks, producer_slot=producer_slot,
                 parity=route_parity, expected=route_expected, prefetched=prefetched, route_rounds=pre_rounds,
                 prefetch_args=prefetch_args, dedup=dedup_rows, direct_done=direct_done, running_half=running_half,
+                light_release=light_release,
             )
         payload_parity, payload_expected = _load_epoch()
         if owner:
@@ -1279,6 +1296,29 @@ def compile_mega_moe_stage1(
                 lookahead=g1_lookahead, row_map=row_map, plan_lookup=plan_lookup, a_ahead=g1_a_ahead,
                 fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed, a_dtype=a_dtype, unroll_k=g1_unroll,
             )
+
+        def _run_half_tile(flat):
+            # g1_split_tail: a half-width unit (flat index over 2 * N_TILES n-tiles of tile_n // 2), streaming W1.
+            # Built at its call, in the half-unit branch, so its setup is not live through the kernel; its K loop
+            # stays rolled (a second unrolled body spills).
+            _, do_half = build_fused_gemm1(
+                x_tensor=x, w_rsrc=w_rsrc,
+                sw_rsrc=sw_rsrc, sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc,
+                trb_rsrc=trb_rsrc, tib_rsrc=trb_rsrc, expert_rsrc=expert_rsrc, out_tensor=out,
+                a_buf=a_buf, a_scale_lds=a_scale_lds, c_tile=c_tile,
+                model_dim=model_dim, inter_dim=inter_dim, sort_block_m=sort_block_m,
+                tile_n=tile_n // 2, num_waves=NUM_WAVES, n_per_wave=n_per_wave // 2, wave_id=wave_id,
+                m_repeat=M_REPEAT, num_acc_n=NUM_ACC_N // 2, a_k_step_bytes=A_K_STEP_BYTES,
+                total_threads=TOTAL_THREADS, k_iters=K_ITERS, a_lds_i32=a_lds_i32,
+                n_tiles=2 * N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
+                swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
+                async_a_copy=async_a_copy, use_tile_resource=use_tile_resource, indirect_input=False, evec=epi_evec,
+                swiglu_limit=swiglu_limit,
+                rows_rsrc=ptr_buf_tensor(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
+                lookahead=g1_lookahead, row_map=row_map, plan_lookup=plan_lookup, a_ahead=g1_a_ahead,
+                fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed, a_dtype=a_dtype,
+            )
+            do_half(flat)
 
         a_g2_cnt = _disp_ptr(DispatchSlot.G2_CNT)
         a_g2_ready = _disp_ptr(DispatchSlot.G2_READY)
@@ -1383,6 +1423,17 @@ def compile_mega_moe_stage1(
         def _cut_own(m):
             return (m == cut_lo) | (m == cut_hi)
 
+        # End of the slice's GEMM1 claim space (units, and with SPLIT_TAIL the halves of its split units).
+        claim_end = split_start = shard_work
+        if const_expr(SPLIT_TAIL):
+            # Every CTA of an XCD joins its GEMM1 pool: the slice's last round leaves rem units on xcd_ctas CTAs,
+            # and up to xcd_ctas - rem of them run as two halves.
+            xcd_ctas = fx.Int32(launch_grid_x // 8)
+            rem = shard_work - (shard_work // xcd_ctas) * xcd_ctas
+            split_n = (rem < xcd_ctas - rem).select(rem, xcd_ctas - rem)
+            split_n = (split_n < fx.Int32(SPLIT_TAIL)).select(split_n, fx.Int32(SPLIT_TAIL))
+            split_start = shard_work - split_n
+            claim_end = shard_work + split_n
         pend_m = fx.Int32(-1)
         g1_fetch = fx.Int32(0)
         g1_leave = fx.Int32(0)
@@ -1391,11 +1442,17 @@ def compile_mega_moe_stage1(
             early_cta = ((fx.block_idx.x >> fx.Int32(3)) % fx.Int32(G2_EARLY_K)) == fx.Int32(0)
             early_thr = early_cta.select(shard_work * fx.Int32(G2_EARLY_P) // fx.Int32(16), shard_work)
 
-        def _count_tile(m):
+        # Count of a finished m-tile: N_TILES units, or 2 * N_TILES half-width units with SPLIT_TAIL.
+        M_TILE_COUNT = N_TILES * (2 if SPLIT_TAIL else 1)
+
+        def _count_tile(m, piece_inc=None):
             # Count a finished tile of m-tile m (its stores completed before the loop-end barrier); the last of
             # the m-tile's N_TILES tiles raises its GEMM2 ready epoch. A cut m-tile runs on two XCDs: each counts
             # its part once, by its last own unit, after writing its L2 back for the other XCD's GEMM2 tiles.
+            # SPLIT_TAIL: the counts are in half-width units (piece_inc 2 for a whole unit, 1 for a half).
             inc = fx.Int32(1)
+            if const_expr(SPLIT_TAIL):
+                inc = piece_inc
             if _cut_own(m):
                 side = (m == cut_lo).select(fx.Int32(4), fx.Int32(8))
                 own_hi = (shard_end < (m + fx.Int32(1)) * fx.Int32(N_TILES)).select(
@@ -1403,25 +1460,33 @@ def compile_mega_moe_stage1(
                 own_lo = (shard_base > m * fx.Int32(N_TILES)).select(shard_base, m * fx.Int32(N_TILES))
                 old_own = fx.Int32(comm_ops.atomic_add_agent(
                     a_work_head + fx.Int64(work_shard) * fx.Int64(64) + fx.Int64(side), fx.Int32(1)))
-                inc = (old_own + fx.Int32(1) == own_hi - own_lo).select(own_hi - own_lo, fx.Int32(0))
+                if const_expr(SPLIT_TAIL):
+                    # The side word counts this XCD's pieces of the m-tile: its units from split_start on are two.
+                    own_units = own_hi - own_lo
+                    split_lo = shard_base + split_start
+                    split_own = own_hi - (own_lo > split_lo).select(own_lo, split_lo)
+                    own_pieces = own_units + (split_own > fx.Int32(0)).select(split_own, fx.Int32(0))
+                    inc = (old_own + fx.Int32(1) == own_pieces).select(own_units * fx.Int32(2), fx.Int32(0))
+                else:
+                    inc = (old_own + fx.Int32(1) == own_hi - own_lo).select(own_hi - own_lo, fx.Int32(0))
                 if inc != fx.Int32(0):
                     comm_ops.fence_agent_release()
             if inc != fx.Int32(0):
                 cnt_addr = a_g2_cnt + fx.Int64(m) * fx.Int64(4)
                 old_cnt = fx.Int32(comm_ops.atomic_add_agent(cnt_addr, inc))
-                if old_cnt + inc == fx.Int32(N_TILES):
+                if old_cnt + inc == fx.Int32(M_TILE_COUNT):
                     # One writer per m-tile and launch; GEMM2 waits for equality, so the epoch may wrap
                     # (a max would stick at 0xffffffff).
                     comm_ops.store_i32_global_agent_release(a_g2_ready + fx.Int64(m) * fx.Int64(4), gate_epoch)
                     # All counts of this launch are in: rewind to 0, since the next launch's config may use another
                     # N_TILES (tile_n 256 / 128), and a leftover count would make its ready fire early or never.
-                    comm_ops.atomic_add_agent(cnt_addr, fx.Int32(-N_TILES))
+                    comm_ops.atomic_add_agent(cnt_addr, fx.Int32(-M_TILE_COUNT))
         while consumer_active:
             if tid == fx.Int32(0):
                 local_work = first_local
                 if g1_fetch != fx.Int32(0):
                     if const_expr(G2_EARLY_K > 0):
-                        local_work = shard_work
+                        local_work = claim_end
                         if g1_leave == fx.Int32(0):
                             local_work = fx.Int32(comm_ops.atomic_add_agent(
                                 a_work_head + fx.Int64(work_shard) * fx.Int64(64), fx.Int32(1)))
@@ -1434,28 +1499,65 @@ def compile_mega_moe_stage1(
                 # Count the previous tile of this CTA (its stores completed before the loop-end barrier)
                 # next to the work fetch, so the two atomics share one round trip.
                 if pend_m >= fx.Int32(0):
-                    _count_tile(pend_m)
-                work = (local_work < shard_work).select(shard_base + local_work, total_work)
+                    if const_expr(SPLIT_TAIL):
+                        # pend_m = 2 * m-tile + 1 for a half unit (it counts 1 of the m-tile's 2 * N_TILES).
+                        _count_tile(pend_m >> fx.Int32(1), fx.Int32(2) - (pend_m & fx.Int32(1)))
+                    else:
+                        _count_tile(pend_m)
+                if const_expr(SPLIT_TAIL):
+                    # A claim past split_start is half (index - split_start) & 1 of unit split_start + its half.
+                    in_slice = local_work < claim_end
+                    half_index = local_work - split_start
+                    is_half = in_slice & (half_index >= fx.Int32(0))
+                    unit = is_half.select(split_start + (half_index >> fx.Int32(1)), local_work)
+                    piece = is_half.select((half_index & fx.Int32(1)) + fx.Int32(1), fx.Int32(0))
+                    work = in_slice.select((shard_base + unit) | (piece << fx.Int32(_PIECE_SHIFT)), total_work)
+                else:
+                    work = (local_work < shard_work).select(shard_base + local_work, total_work)
                 # The shard's GEMM2 units follow its GEMM1 units on the same counter: the fetch that ends
                 # GEMM1 is this CTA's first GEMM2 unit.
-                fx.ptr_store(local_work - shard_work, g2_scratch)
+                fx.ptr_store(local_work - claim_end, g2_scratch)
                 fx.ptr_store(Vec.from_elements([work], fx.Int32), work_scratch)
             fx.barrier()
             work = Vec(work_scratch_view.load())[0]
+            if const_expr(SPLIT_TAIL):
+                piece = work >> fx.Int32(_PIECE_SHIFT)
+                work = work & fx.Int32((1 << _PIECE_SHIFT) - 1)
             has_work = (work < total_work).select(fx.Int32(1), fx.Int32(0))
-            if has_work != fx.Int32(0):
-                if const_expr(b_cache_modifier != 0):
-                    if cached_w != fx.Int32(0):
-                        _do_cached_tile(work)
+            if const_expr(SPLIT_TAIL):
+                if (has_work != fx.Int32(0)) & (piece != fx.Int32(0)):
+                    _run_half_tile(work * fx.Int32(2) + piece - fx.Int32(1))
+                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                    fx.barrier()
+                if (has_work != fx.Int32(0)) & (piece == fx.Int32(0)):
+                    if const_expr(b_cache_modifier != 0):
+                        if cached_w != fx.Int32(0):
+                            _do_cached_tile(work)
+                        else:
+                            _do_scheduled_tile(work)
                     else:
                         _do_scheduled_tile(work)
-                else:
-                    _do_scheduled_tile(work)
-                # Same-XCD handoff: store completion puts the tile in the shared L2; the next work fetch
-                # counts it and the last of the m-tile's N_TILES CTAs raises its ready epoch.
-                fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-                fx.barrier()
-            pend_m = (has_work != fx.Int32(0)).select(work // fx.Int32(N_TILES), fx.Int32(-1))
+                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                    fx.barrier()
+            else:
+                if has_work != fx.Int32(0):
+                    if const_expr(b_cache_modifier != 0):
+                        if cached_w != fx.Int32(0):
+                            _do_cached_tile(work)
+                        else:
+                            _do_scheduled_tile(work)
+                    else:
+                        _do_scheduled_tile(work)
+                    # Same-XCD handoff: store completion puts the tile in the shared L2; the next work fetch
+                    # counts it and the last of the m-tile's N_TILES CTAs raises its ready epoch.
+                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                    fx.barrier()
+            if const_expr(SPLIT_TAIL):
+                pend_m = (has_work != fx.Int32(0)).select(
+                    (work // fx.Int32(N_TILES)) * fx.Int32(2) + (piece != fx.Int32(0)).select(fx.Int32(1), fx.Int32(0)),
+                    fx.Int32(-1))
+            else:
+                pend_m = (has_work != fx.Int32(0)).select(work // fx.Int32(N_TILES), fx.Int32(-1))
             consumer_active = has_work != fx.Int32(0)
             g1_fetch = fx.Int32(1)
             if const_expr(G2_EARLY_K > 0):
@@ -1473,7 +1575,7 @@ def compile_mega_moe_stage1(
         g2_head = a_work_head + fx.Int64(work_shard) * fx.Int64(64)
         g2_active = fx.Int32(1) == fx.Int32(1)
         g2_fetch = fx.Int32(0)
-        g2_claim_base = shard_work
+        g2_claim_base = claim_end
         if const_expr(G2_EARLY_K > 0):
             g2_head = g2_head + fx.Int64(12)
             g2_fetch = fx.Int32(1)
@@ -1594,6 +1696,7 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
         g1_a_ahead=k1.g1_a_ahead, direct_done=k1.direct_done, tok_done=k1.tok_done, tok_counters=k1.tok_counters,
         bf16_head_tokens=k1.bf16_head_tokens, epi_evec=k1.epi_evec, epi_lean=k1.epi_lean,
         ascale_packed=k1.ascale_packed, stream_w=k1.stream_w, g1_unroll=k1.g1_unroll_k,
+        light_release=k1.light_release, g1_split_tail=k1.g1_split_tail,
     )
     # fmt: on
 
