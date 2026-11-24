@@ -60,6 +60,7 @@ from .mega_moe_config import (
     FUSED_QUANTS,
     MegaMoEConfig,
     fused_layout_supported,
+    fused_quant,
     large_m_mtprs_for,
     select_fused_config,
 )
@@ -1809,6 +1810,11 @@ def large_m_kernel_specs(
         s2_spec += (("disp_early_clear", 1),)
     if k1.epi_evec != 2:
         s2_spec += (("g1_epi_vec", int(k1.epi_evec)),)
+    if k1.g1_unroll_k:
+        assert not k1.g1_pair_k
+        s2_spec += (("g1_unroll", 1),)
+    if k1.g1_pair_k:
+        s2_spec += (("g1_pair_k", 1),)
     if k1.dedup_rows:
         assert k1.batch_rows
         s2_spec += (("g1_dedup", 1),)
@@ -1976,7 +1982,7 @@ def compile_mega_moe_stage1(
             "disp_no_ready", "g1_one_acq", "disp_no_rel", "g1_a_async", "g1_as_pack", "g1_epi_lean", "g2_a_uni", "g2_skip_pad", "disp_batch",
             "plan_lean", "plan_tag", "disp_bucket", "disp_presend", "disp_presend_rows", "disp_pmb_small", "g2_m_group", "g2_early", "g2_early_xcd", "g2_nt_single",
             "g2_early_mid", "disp_early_hist", "disp_peer_hoist",
-            "disp_early_clear")
+            "disp_early_clear", "g1_unroll", "g1_pair_k")
     }
     # g1_short_rows > 0: a GEMM1 m-tile whose row g1_short_rows is padding (an expert's tail tile) runs a
     # g1_short_rows-row tile; padding sits at the end of an expert's rows, so so does every later row.
@@ -2003,6 +2009,10 @@ def compile_mega_moe_stage1(
     G1_AS_PACK = bool(_s2.get("g1_as_pack", 0))
     # g1_epi_lean: the GEMM1 epilogue's quantize/store pass without serial waits (SiluQuantEpilogue lean).
     G1_EPI_LEAN = int(_s2.get("g1_epi_lean", 0))
+    # g1_unroll: the GEMM1 K loop fully unrolled (no loop-carried B registers drained at a back-edge).
+    G1_UNROLL = bool(_s2.get("g1_unroll", 0))
+    # g1_pair_k: the GEMM1 K loop runs two K-steps per iteration (ping-pong B registers).
+    G1_PAIR_K = bool(_s2.get("g1_pair_k", 0))
     # disp_batch: with g1_dedup, a payload chunk resolves its routes one per thread, then copies the sent rows.
     DISP_BATCH = bool(_s2.get("disp_batch", 0))
     # disp_presend: with disp_batch, the consumer CTAs send the first payload round's token rows before the plan.
@@ -2467,7 +2477,7 @@ def compile_mega_moe_stage1(
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource, indirect_input=False,
             evec=G1_EPI_VEC, swiglu_limit=swiglu_limit, out_cache_modifier=G1_OUT_CACHE, tile_zero=True,
             fused_v8=True, epi_lean=G1_EPI_LEAN, short_rows=G1_SHORT_ROWS, fold_rows=G1_FOLD, row_map=g1_row_map,
-            a_async_lds=G1_A_ASYNC, ascale_packed=G1_AS_PACK, a_dtype=a_dtype,
+            a_async_lds=G1_A_ASYNC, ascale_packed=G1_AS_PACK, a_dtype=a_dtype, pair_k=G1_PAIR_K, unroll_k=G1_UNROLL,
         )
         _do_scheduled_tile = g1_runners[1]
         _do_short_tile = g1_runners[2] if G1_SHORT_ROWS else None
@@ -2488,7 +2498,8 @@ def compile_mega_moe_stage1(
                 async_a_copy=async_a_copy, use_tile_resource=use_tile_resource, indirect_input=False,
                 evec=G1_EPI_VEC, swiglu_limit=swiglu_limit, out_cache_modifier=G1_OUT_CACHE, tile_zero=True,
                 fused_v8=True, epi_lean=G1_EPI_LEAN, short_rows=G1_MID_ROWS, row_map=g1_row_map,
-                a_async_lds=G1_A_ASYNC, ascale_packed=G1_AS_PACK, a_dtype=a_dtype,
+                a_async_lds=G1_A_ASYNC, ascale_packed=G1_AS_PACK, a_dtype=a_dtype, pair_k=G1_PAIR_K,
+                unroll_k=G1_UNROLL,
             )[2]
 
         if tid == fx.Int32(0):
@@ -3055,7 +3066,14 @@ class LargeMRuntime:
 
     @classmethod
     def indexed_payload(
-        cls, *, world_size, model_dim, inter_dim, experts, max_tok_per_rank
+        cls,
+        *,
+        world_size,
+        model_dim,
+        inter_dim,
+        experts,
+        max_tok_per_rank,
+        a_dtype="fp8",
     ):
         """Whether the dispatch stores one payload row per (source rank, token): dedup_rows sends a token's row to a
         destination once, at row rank * mtpr + token, so the route-major rows are never written.
@@ -3068,6 +3086,7 @@ class LargeMRuntime:
             experts_per_rank=experts // world_size,
             model_dim=model_dim,
             inter_dim=inter_dim,
+            quant=fused_quant(a_dtype),
         ).fused_stage1.dedup_rows
 
     @classmethod
@@ -3100,12 +3119,21 @@ class LargeMRuntime:
                 inter_dim=inter_dim,
                 experts=experts,
                 max_tok_per_rank=max_tok_per_rank,
+                a_dtype=a_dtype,
             ),
         )
 
     @classmethod
     def ends_all_ranks(
-        cls, *, world_size, model_dim, inter_dim, experts, topk, max_tok_per_rank
+        cls,
+        *,
+        world_size,
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        max_tok_per_rank,
+        a_dtype="fp8",
     ):
         """Whether every launch ends only once every rank finished its GEMM2 (the combine's generation barrier).
 
@@ -3121,6 +3149,7 @@ class LargeMRuntime:
             experts_per_rank=experts // world_size,
             model_dim=model_dim,
             inter_dim=inter_dim,
+            quant=fused_quant(a_dtype),
         ).fused_stage2.comb_tok_wait
 
     # fmt: off
@@ -3180,7 +3209,7 @@ class LargeMRuntime:
             enable_std_moe=False, enable_group_major=True, gm_unit_size=self.GM_UNIT_SIZE,
             gm_scheme=mega_scheme, gm_compact=self.GM_COMPACT,
             gm_indexed_payload=self.indexed_payload(world_size=self.world_size, model_dim=self.model_dim,
-                inter_dim=self.inter_dim, experts=self.experts, max_tok_per_rank=self.mtpr),
+                inter_dim=self.inter_dim, experts=self.experts, max_tok_per_rank=self.mtpr, a_dtype=self._a_dtype),
             max_total_recv_tokens=self.world_size)
         # fmt: on
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(
@@ -3429,7 +3458,7 @@ class LargeMRuntime:
     def _select_config(self, tokens: int) -> MegaMoEConfig:
         config = select_fused_config(
             tokens, self.mtpr, world_size=self.world_size, experts_per_rank=self.epr,
-            model_dim=self.model_dim, inter_dim=self.inter_dim,
+            model_dim=self.model_dim, inter_dim=self.inter_dim, quant=fused_quant(self._a_dtype),
         )
         self._active_config = config
         return config

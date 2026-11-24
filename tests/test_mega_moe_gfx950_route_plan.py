@@ -252,6 +252,7 @@ def test_large_m_buffers_fit_32bit_offsets(layout, quant):
             experts_per_rank=epr,
             model_dim=model_dim,
             inter_dim=inter_dim,
+            quant=quant,
         )
         num_valid_max, payload_rows, payload_row_bytes, _ = (
             LargeMRuntime.payload_capacity(
@@ -421,9 +422,10 @@ def test_ep8_fused_configs_keep_fused_knobs_off():
         assert config.fused_stage2 == FusedStage2Knobs(), (mtpr, tokens)
 
 
-# Fused knobs added with the EP2 V4.1-Flash tune: they enter the table only when set, so a digest pinned before
-# them changes only where a config sets one.
-_EP2_KNOBS = ("stream_w",)
+# Fused knobs added after the digests below were pinned (stream_w with the EP2 V4.1-Flash tune, the GEMM1 K-loop
+# knobs with the A4W4 tunes): they enter the table only when set, so a pinned digest changes only where a config
+# sets one.
+_LATE_KNOBS = ("stream_w", "g1_unroll_k", "g1_pair_k")
 
 
 def _knob_table(config):
@@ -434,7 +436,7 @@ def _knob_table(config):
         tuple(
             (f.name, getattr(config.fused_stage1, f.name))
             for f in fields(FusedStage1Knobs)
-            if f.name not in _EP2_KNOBS
+            if f.name not in _LATE_KNOBS
             or getattr(config.fused_stage1, f.name) != f.default
         ),
         tuple(
@@ -966,3 +968,45 @@ def test_large_m_a4w4_runs_the_a8w4_config(layout, mtpr):
         rows.append(sbm + k1.short_tail_rows)
     for tile_rows in rows:
         assert tile_rows * (128 // 16) % 64 == 0, tile_rows
+
+
+def test_fused_config_quant():
+    with pytest.raises(ValueError, match="quant"):
+        select_fused_config(1, 512, quant="a16w4")
+    # Every fused route and layout serves A4W4 with a config of its own selection.
+    for shape in ({}, V41_FLASH_EP4_SHAPE, V41_FLASH_EP2_SHAPE, V41_FLASH_EP8_SHAPE):
+        for mtpr in (512, 16384):
+            config = select_fused_config(1, mtpr, quant="a4w4", **shape)
+            assert config.p2p_quant == select_fused_config(1, mtpr, **shape).p2p_quant
+
+
+def test_large_m_gemm1_k_loop_knobs_enter_the_spec():
+    from dataclasses import replace
+
+    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import (
+        large_m_kernel_specs,
+    )
+
+    base = select_fused_config(16384, 16384)
+
+    def spec(**knobs):
+        config = replace(base, fused_stage1=replace(base.fused_stage1, **knobs))
+        s2_spec, _ = large_m_kernel_specs(
+            config,
+            model_dim=7168,
+            inter_dim=3072,
+            topk=6,
+            rank=0,
+            npes=8,
+            mtpr=16384,
+            experts_per_rank=48,
+            num_valid_max=16384 * 6,
+        )
+        return dict(s2_spec)
+
+    # Off (the default) leaves the spec, and so the kernel identity, unchanged.
+    assert "g1_unroll" not in spec() and "g1_pair_k" not in spec()
+    assert spec(g1_unroll_k=True)["g1_unroll"] == 1
+    assert spec(g1_pair_k=True)["g1_pair_k"] == 1
+    with pytest.raises(AssertionError):
+        spec(g1_unroll_k=True, g1_pair_k=True)

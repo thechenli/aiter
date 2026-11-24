@@ -39,7 +39,7 @@ class _LdsF32View:
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, pipe_weights,
     mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input, pair_k, narrow_final_a, tile_zero=False,
-    row_map=None):
+    row_map=None, unroll_k=False):
 # fmt: on
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B_SCALE = NUM_ACC_N // _PACK
@@ -181,7 +181,13 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 yv += sa_next
             return yv
 
-        if const_expr(pair_k):
+        if const_expr(unroll_k):
+            # Fully unrolled K loop: no loop-carried B registers, so each step's B prefetch stays in flight under
+            # the next step's MFMAs instead of being drained at a back-edge.
+            state = init
+            for sp_c in range_constexpr(K_ITERS - 1):
+                state = _kstep(sp_c, state)
+        elif const_expr(pair_k):
             # Two K steps per iteration (ping-pong B registers): the rolled loop
             # copies the prefetched B tile into loop-carried registers, which
             # forces a vmcnt drain of the prefetch every step.
@@ -311,7 +317,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
 @flyc.jit
 def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, trb_rsrc, rows_rsrc, LA, row_map=None,
-    meta=None, a_ahead=1):
+    meta=None, a_ahead=1, unroll_k=False):
 # fmt: on
     """pipe_weights K-loop with B / B-scale issued LA K-steps ahead, unrolled xLA.
 
@@ -325,6 +331,7 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
     :func:`do_tile`, without the arrival wait.
     a_ahead > 1: the A rows of K-step k + a_ahead are loaded into registers at step k and written to LDS at step
     k + a_ahead - 1. With a_ahead=1 the end-of-step LDS write waits for a load issued at the start of the same step.
+    ``unroll_k`` unrolls every K-step at any a_ahead (no loop back-edge).
     """
     assert 1 <= a_ahead < K_ITERS
     N_ACC = M_REPEAT * NUM_ACC_N
@@ -412,7 +419,7 @@ def do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_
 
     # a_ahead > 1 unrolls every K-step: a loop would rotate the register queues through phi copies, which wait for
     # the loads still in flight.
-    n_loop = 0 if const_expr(a_ahead > 1) else (K_ITERS - LA) // LA
+    n_loop = 0 if const_expr(a_ahead > 1 or unroll_k) else (K_ITERS - LA) // LA
     state = init
     if const_expr(n_loop > 0):
         for it_i, state in range(0, n_loop, 1, init=init):
@@ -439,7 +446,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     source_rows=0, a_dtype="fp8", out_dtype="fp8", swiglu_limit=0.0, pair_k=False, evec,
     act="silu", situ_beta=1.0, situ_linear_beta=1.0, narrow_final_a=False, rows_rsrc=None, lookahead=0,
     out_cache_modifier=0, tile_zero=False, fused_v8=False, epi_lean=0, row_map=None, short_rows=0, fold_rows=0,
-    a_async_lds=False, ascale_packed=False, plan_lookup=None, a_ahead=1):
+    a_async_lds=False, ascale_packed=False, plan_lookup=None, a_ahead=1, unroll_k=False):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner.
 
@@ -449,7 +456,8 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     The remaining knobs serve the fused kernels: ``fused_v8`` / ``epi_lean`` pick the fused evec 8 epilogue
     (SiluQuantEpilogue), ``row_map`` reads A through the srcmap (:func:`do_tile`), ``a_async_lds`` /
     ``ascale_packed`` are the A loaders' modes, ``plan_lookup(m_tile) -> (expert, tile_row_base, rows)`` takes
-    the lookahead tiles' metadata from the CTA's own plan and ``a_ahead`` is :func:`do_tile_la`'s.
+    the lookahead tiles' metadata from the CTA's own plan and ``a_ahead`` is :func:`do_tile_la`'s. ``unroll_k``
+    fully unrolls the K loop of every tile runner (:func:`do_tile` / :func:`do_tile_la`).
 
     short_rows > 0 also returns a runner for tiles whose rows past the first short_rows are all padding: it
     computes and stores only those leading rows (m_repeat short_rows // 16) and leaves the rest unwritten.
@@ -528,14 +536,14 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
             assert pipe_weights and not async_a_copy and not mfma_amajor and not indirect_input
             do_tile_la(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi,
                 a_buf, a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n, a_k_step_bytes, trb_rsrc, rows_rsrc,
-                lookahead, row_map, meta, a_ahead)
+                lookahead, row_map, meta, a_ahead, unroll_k)
             return
         assert plan_lookup is None
         do_tile(m_tile, n_tile_base, expert, sched, a_gather,
             a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
             a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
             a_k_step_bytes, pipe_weights, mfma_amajor, async_a_copy,
-            trb_rsrc, tib_rsrc, indirect_input, pair_k, narrow_final_a, tile_zero, row_map)
+            trb_rsrc, tib_rsrc, indirect_input, pair_k, narrow_final_a, tile_zero, row_map, unroll_k)
         # fmt: on
 
     if const_expr(not short_rows):
@@ -559,7 +567,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         # fmt: off
         do_tile(m_tile, n_tile_base, expert, sched, a_gather_s, a_s2r, b_loader, b_scale, a_scale_s, mfma_s, epi_s,
             a_buf, a_scale_lds, a_lds_i32, k_iters, s_repeat, num_acc_n, a_k_step_bytes, pipe_weights, mfma_amajor,
-            async_a_copy, trb_rsrc, tib_rsrc, False, pair_k, narrow_final_a, tile_zero, row_map)
+            async_a_copy, trb_rsrc, tib_rsrc, False, pair_k, narrow_final_a, tile_zero, row_map, unroll_k)
         # fmt: on
 
     if const_expr(not fold_rows):
@@ -587,7 +595,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
         do_tile(m_tile, n_tile_base, expert, sched, a_gather_f, a_s2r, b_loader, b_scale, a_scale_f, mfma_f, epi_f,
             a_buf, a_scale_lds, f_rows * a_k_step_bytes // 4, k_iters, f_repeat, num_acc_n, a_k_step_bytes,
             pipe_weights, mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, False, pair_k, narrow_final_a, tile_zero,
-            row_map)
+            row_map, unroll_k)
         # fmt: on
 
     return expert_of_flat, do_scheduled_tile, do_short_tile, do_fold_tile

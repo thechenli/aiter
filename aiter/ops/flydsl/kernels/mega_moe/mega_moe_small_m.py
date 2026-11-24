@@ -49,6 +49,7 @@ from .mega_moe_config import (
     SMALL_M_MAX_MTPR,
     MegaMoEConfig,
     fused_layout_supported,
+    fused_quant,
     nearest_token_bucket,
     select_fused_config,
     small_m_cu_supported,
@@ -871,7 +872,7 @@ def compile_mega_moe_stage1(
     plan_local: bool = False, g2_early: tuple = (0, 0), g2_uniform: bool = False, head_uniform: bool = False,
     g2_epi_lean: int = 0, g1_lookahead: int = 1, g1_a_ahead: int = 1, direct_done: int = 0, tok_done: bool = False,
     tok_counters: bool = False, bf16_head_tokens: int = 0, epi_evec: int = 2, epi_lean: int = 0,
-    ascale_packed: bool = False, stream_w: bool = False, a_dtype: str = "fp8",
+    ascale_packed: bool = False, stream_w: bool = False, a_dtype: str = "fp8", g1_unroll: bool = False,
 ):
     arch = get_gfx_runtime()
     if arch != "gfx950":
@@ -1050,6 +1051,7 @@ def compile_mega_moe_stage1(
         f"{'_ap' if ascale_packed else ''}"
         f"{f'_ek{G2_EARLY_K}p{G2_EARLY_P}' if G2_EARLY_K else ''}"
         f"{'_stw' if stream_w else ''}"
+        f"{'_uk' if g1_unroll else ''}"
         f"{'_afp4' if a_fp4 else ''}"
     )
 
@@ -1255,7 +1257,7 @@ def compile_mega_moe_stage1(
             swiglu_limit=swiglu_limit,
             rows_rsrc=ptr_buf_tensor(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
             lookahead=g1_lookahead, row_map=row_map, plan_lookup=plan_lookup, a_ahead=g1_a_ahead,
-            fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed, a_dtype=a_dtype,
+            fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed, a_dtype=a_dtype, unroll_k=g1_unroll,
         )
         # A rank that receives many rows holds experts with many m-tiles: it reads W1 through the cache so they
         # reuse it, while the other ranks keep streaming W1 once per tile.
@@ -1275,7 +1277,7 @@ def compile_mega_moe_stage1(
                 swiglu_limit=swiglu_limit,
                 rows_rsrc=ptr_buf_tensor(_disp_ptr(DispatchSlot.TILE_ROWS), fx.Int32),
                 lookahead=g1_lookahead, row_map=row_map, plan_lookup=plan_lookup, a_ahead=g1_a_ahead,
-                fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed, a_dtype=a_dtype,
+                fused_v8=True, epi_lean=epi_lean, ascale_packed=ascale_packed, a_dtype=a_dtype, unroll_k=g1_unroll,
             )
 
         a_g2_cnt = _disp_ptr(DispatchSlot.G2_CNT)
@@ -1591,7 +1593,7 @@ def _kernel_knobs(config: MegaMoEConfig) -> dict:
         head_uniform=k1.head_uniform, g2_epi_lean=k1.g2_epi_lean, g1_lookahead=k1.g1_lookahead,
         g1_a_ahead=k1.g1_a_ahead, direct_done=k1.direct_done, tok_done=k1.tok_done, tok_counters=k1.tok_counters,
         bf16_head_tokens=k1.bf16_head_tokens, epi_evec=k1.epi_evec, epi_lean=k1.epi_lean,
-        ascale_packed=k1.ascale_packed, stream_w=k1.stream_w,
+        ascale_packed=k1.ascale_packed, stream_w=k1.stream_w, g1_unroll=k1.g1_unroll_k,
     )
     # fmt: on
 
@@ -1643,6 +1645,7 @@ class SmallMRuntime:
             experts_per_rank=experts // world_size,
             model_dim=model_dim,
             inter_dim=inter_dim,
+            quant=fused_quant(a_dtype),
         )
         if config.fused_stage1.dedup_rows:
             rows += world_size * max_tok_per_rank
@@ -1650,7 +1653,15 @@ class SmallMRuntime:
 
     @classmethod
     def ends_all_ranks(
-        cls, *, world_size, model_dim, inter_dim, experts, topk, max_tok_per_rank
+        cls,
+        *,
+        world_size,
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        max_tok_per_rank,
+        a_dtype="fp8",
     ):
         """Whether every launch ends only once every peer's grid finished (its combine waits for every peer's flag).
 
@@ -1666,6 +1677,7 @@ class SmallMRuntime:
                 experts_per_rank=experts // world_size,
                 model_dim=model_dim,
                 inter_dim=inter_dim,
+                quant=fused_quant(a_dtype),
             ).fused_stage1.tok_done
             for bucket in FUSED_TOKEN_BUCKETS
             if bucket <= max_tok_per_rank
@@ -1717,7 +1729,7 @@ class SmallMRuntime:
         self._configs = {
             bucket: select_fused_config(
                 bucket, self.mtpr, world_size=self.world_size, experts_per_rank=self.epr,
-                model_dim=self.model_dim, inter_dim=self.inter_dim,
+                model_dim=self.model_dim, inter_dim=self.inter_dim, quant=quant,
             )
             for bucket in FUSED_TOKEN_BUCKETS
             if bucket <= self.mtpr
